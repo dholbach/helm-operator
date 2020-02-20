@@ -12,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 
+	"github.com/fluxcd/helm-operator/pkg/annotator"
 	v1 "github.com/fluxcd/helm-operator/pkg/apis/helm.fluxcd.io/v1"
 	"github.com/fluxcd/helm-operator/pkg/chartsync"
 	v1client "github.com/fluxcd/helm-operator/pkg/client/clientset/versioned/typed/helm.fluxcd.io/v1"
@@ -64,17 +65,19 @@ type Release struct {
 	coreV1Client      corev1client.CoreV1Interface
 	helmReleaseClient v1client.HelmV1Interface
 	gitChartSync      *chartsync.GitChartSync
+	annotator         *annotator.Annotator
 	config            Config
 }
 
 func New(logger log.Logger, coreV1Client corev1client.CoreV1Interface, helmReleaseClient v1client.HelmV1Interface,
-	gitChartSync *chartsync.GitChartSync, config Config) *Release {
+	gitChartSync *chartsync.GitChartSync, annotator *annotator.Annotator, config Config) *Release {
 
 	r := &Release{
 		logger:            logger,
 		coreV1Client:      coreV1Client,
 		helmReleaseClient: helmReleaseClient,
 		gitChartSync:      gitChartSync,
+		annotator:         annotator,
 		config:            config.WithDefaults(),
 	}
 	return r
@@ -178,7 +181,7 @@ func (r *Release) Sync(client helm.Client, hr *v1.HelmRelease) (rHr *v1.HelmRele
 		return hr, ErrComposingValues
 	}
 
-	ok, diff, err := shouldSync(logger, client, hr, curRel, chartPath, revision, composedValues, r.config.LogDiffs)
+	ok, diff, err := shouldSync(logger, r.annotator, client, hr, curRel, chartPath, composedValues, r.config.LogDiffs)
 	if !ok {
 		if err != nil {
 			_ = status.SetCondition(r.helmReleaseClient.HelmReleases(hr.Namespace), hr, status.NewCondition(
@@ -291,7 +294,9 @@ func (r *Release) Sync(client helm.Client, hr *v1.HelmRelease) (rHr *v1.HelmRele
 		err = ErrRolledBack
 	}
 
-	annotateResources(logger, rel, hr.ResourceID())
+	if err := r.annotator.Annotate(rel.Resources, rel.Namespace, v1.AntecedentAnnotation, hr.ResourceID().String()); err != nil {
+
+	}
 
 	return hr, err
 }
@@ -321,8 +326,8 @@ func (r *Release) Uninstall(client helm.Client, hr *v1.HelmRelease) {
 // determine if any undefined mutations have occurred. It returns two
 // booleans indicating if the release should be synced and if the reason
 // it should happen is because of a diff, or an error.
-func shouldSync(logger log.Logger, client helm.Client, hr *v1.HelmRelease, curRel *helm.Release,
-	chartPath, revision string, values helm.Values, logDiffs bool) (bool, bool, error) {
+func shouldSync(logger log.Logger, annotator *annotator.Annotator, client helm.Client, hr *v1.HelmRelease, curRel *helm.Release,
+	chartPath string, values helm.Values, logDiffs bool) (bool, bool, error) {
 
 	// Without valid YAML we will not get anywhere, return early.
 	b, err := values.YAML()
@@ -336,11 +341,19 @@ func shouldSync(logger log.Logger, client helm.Client, hr *v1.HelmRelease, curRe
 		return true, false, nil
 	}
 
+	// Check if the release is managed by our resource
+	managedBy, resourceID, err := annotator.OneOfResourcesHasAnnotationValueOrNil(curRel.Resources, curRel.Namespace, v1.AntecedentAnnotation, hr.ResourceID().String())
+	// If an error is returned and we were unable to determine ownership,
+	// we return the error (and skip) to avoid conflicts.
+	if err != nil {
+		return false, false, err
+	}
 	// If the release is not managed by our resource, we skip to avoid conflicts.
-	if ok, resourceID := managedByHelmRelease(curRel, *hr); !ok {
+	if !managedBy {
 		logger.Log("warning", "release appears to be managed by "+resourceID, "action", "skip")
 		return false, false, nil
 	}
+
 
 	// If the current state of the release does not allow us to safely upgrade, we skip.
 	if s := curRel.Info.Status; !s.AllowsUpgrade() {
